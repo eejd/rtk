@@ -524,7 +524,6 @@ fn run_log(
         .iter()
         .any(|arg| arg == "--merges" || arg == "--min-parents=2" || arg == "--no-merges");
     // Don't add --no-merges if user explicitly requested merges or an exact count (-n N / --max-count)
-    // When user passes -1 they want 1 commit regardless of whether it's a merge
     if !wants_merges && !has_limit_flag {
         cmd.arg("--no-merges");
     }
