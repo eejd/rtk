@@ -131,6 +131,11 @@ pub struct LimitsConfig {
     pub status_max_untracked: usize,
     /// Max chars for parser passthrough fallback (default: 2000)
     pub passthrough_max_chars: usize,
+    /// Max failing Surefire test classes (and `[ERROR] Failures:` summary
+    /// entries) emitted by the Maven filter. Excess emissions are replaced
+    /// by a `... +N more failing test classes` / `... +N more failures` tail.
+    /// Set to `0` to opt out of the cap entirely. Default: 25.
+    pub mvn_max_failures: usize,
 }
 
 impl Default for LimitsConfig {
@@ -141,6 +146,7 @@ impl Default for LimitsConfig {
             status_max_files: 15,
             status_max_untracked: 10,
             passthrough_max_chars: 2000,
+            mvn_max_failures: 25,
         }
     }
 }

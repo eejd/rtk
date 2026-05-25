@@ -192,6 +192,10 @@ struct SurefireBlock {
     block_running: Option<String>,
     in_block: bool,
     failure_trail: bool,
+    /// When set together with `failure_trail`, consumes the trail (per-test
+    /// `<<< FAILURE!` subline, exception, user frames) without writing it to
+    /// `out`. Used when the caller capped a failing block via `drop_failing`.
+    drop_trail: bool,
 }
 
 enum SurefireStep {
@@ -216,6 +220,7 @@ impl SurefireBlock {
             block_running: None,
             in_block: false,
             failure_trail: false,
+            drop_trail: false,
         }
     }
 
@@ -260,12 +265,18 @@ impl SurefireBlock {
 
         if self.failure_trail {
             if line.is_empty() {
-                out.push('\n');
+                if !self.drop_trail {
+                    out.push('\n');
+                }
                 self.failure_trail = false;
+                self.drop_trail = false;
                 return SurefireStep::Consumed;
             }
             let t = line.trim_start();
             if t.starts_with("at ") && is_framework_frame(t) {
+                return SurefireStep::Consumed;
+            }
+            if self.drop_trail {
                 return SurefireStep::Consumed;
             }
             out.push_str(line);
@@ -274,6 +285,15 @@ impl SurefireBlock {
         }
 
         SurefireStep::Passthrough
+    }
+
+    /// Mark a `FailingClose` as dropped (cap exceeded). The block itself is
+    /// already extracted by `step()`; this sets `failure_trail` so the
+    /// post-close trail (per-test subline, exception, user frames) is
+    /// consumed and silently dropped until the next blank line.
+    fn drop_failing(&mut self) {
+        self.failure_trail = true;
+        self.drop_trail = true;
     }
 
     /// Commit a `FailingClose` to `out`: writes `running`, then `lines` (with
@@ -324,6 +344,91 @@ impl SurefireBlock {
     }
 }
 
+/// `[ERROR] Failures:` summary block cap. Maven emits a summary at the end of
+/// a failing test run:
+///
+/// ```text
+/// [ERROR] Failures:
+/// [ERROR]   ClassA.testFoo:25 expected: <a> but was: <b>
+/// [ERROR]   ClassB.testBar:42 expected: <c> but was: <d>
+/// [INFO]
+/// [ERROR] Tests run: 100, Failures: 50, Errors: 0, Skipped: 0
+/// ```
+///
+/// The aggregate `[ERROR] Tests run:` line is matched by `AGG` and kept; the
+/// `[ERROR]   ` entries are kept by the catch-all `[ERROR]` keeper. On builds
+/// with hundreds of failures this can be quite large. Cap entries at
+/// `mvn_max_failures` and emit `\n... +N more failures\n` immediately before
+/// the `Tests run:` aggregate when entries were dropped.
+struct FailuresSummaryCap {
+    cap: usize,
+    in_summary: bool,
+    emitted: usize,
+    dropped: usize,
+}
+
+impl FailuresSummaryCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            in_summary: false,
+            emitted: 0,
+            dropped: 0,
+        }
+    }
+
+    /// If `line` is an `[ERROR]   ` entry inside the failures summary, write
+    /// it (or count it as dropped) and return `true` so the caller skips its
+    /// own keep-list. Returns `false` otherwise.
+    fn handle_entry(&mut self, line: &str, out: &mut String) -> bool {
+        if !self.in_summary || !line.starts_with("[ERROR]   ") {
+            return false;
+        }
+        if self.cap == 0 || self.emitted < self.cap {
+            out.push_str(line);
+            out.push('\n');
+            self.emitted += 1;
+        } else {
+            self.dropped += 1;
+        }
+        true
+    }
+
+    /// Detect the `[ERROR] Failures:` header so subsequent `[ERROR]   ` lines
+    /// get capped. Caller is responsible for writing the header to `out`.
+    fn handle_header(&mut self, line: &str) {
+        if line.starts_with("[ERROR] Failures:") {
+            self.in_summary = true;
+            self.emitted = 0;
+            self.dropped = 0;
+        }
+    }
+
+    /// Pre-emit the `... +N more failures` tail when the aggregate
+    /// `[ERROR] Tests run:` line is about to be written, then close the
+    /// summary. Caller writes the AGG line itself afterwards.
+    fn handle_aggregate(&mut self, line: &str, out: &mut String) {
+        if !self.in_summary || !AGG.is_match(line) {
+            return;
+        }
+        if self.dropped > 0 {
+            out.push_str(&format!("\n... +{} more failures\n", self.dropped));
+        }
+        self.in_summary = false;
+        self.emitted = 0;
+        self.dropped = 0;
+    }
+
+    /// End-of-stream tail emission for cases where the AGG line never arrives
+    /// (truncated output). Emits the tail with no trailing newline guard so
+    /// the resulting filtered output is still well-formed.
+    fn finish(&mut self, out: &mut String) {
+        if self.in_summary && self.dropped > 0 {
+            out.push_str(&format!("\n... +{} more failures\n", self.dropped));
+        }
+    }
+}
+
 /// Buffered single-pass filter for `mvn test` / `mvn integration-test`.
 ///
 /// Drives [`SurefireBlock`] for the inner block/trail machine; applies the
@@ -334,6 +439,10 @@ impl SurefireBlock {
 /// English-footer guard: if no `BUILD SUCCESS`/`BUILD FAILURE` line is present,
 /// return the ANSI-stripped raw input (non-English locale or truncated output).
 pub fn filter_surefire(raw: &str) -> String {
+    filter_surefire_with_cap(raw, crate::core::config::limits().mvn_max_failures)
+}
+
+fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
     let stripped = strip_ansi(raw);
     if !has_english_footer(&stripped) {
         return stripped;
@@ -343,6 +452,9 @@ pub fn filter_surefire(raw: &str) -> String {
     let mut block = SurefireBlock::new();
     let mut keep_continuation = false;
     let mut in_reactor_summary = false;
+    let mut emitted_failing: usize = 0;
+    let mut dropped_failing: usize = 0;
+    let mut summary = FailuresSummaryCap::new(cap);
 
     for line in stripped.lines() {
         match block.step(line, &mut out) {
@@ -352,7 +464,13 @@ pub fn filter_surefire(raw: &str) -> String {
                 lines,
                 close,
             } => {
-                block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                if cap == 0 || emitted_failing < cap {
+                    block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                    emitted_failing += 1;
+                } else {
+                    block.drop_failing();
+                    dropped_failing += 1;
+                }
                 keep_continuation = false;
                 continue;
             }
@@ -365,10 +483,21 @@ pub fn filter_surefire(raw: &str) -> String {
             continue;
         }
 
+        // Failures-summary cap: gate `[ERROR]   ` entries, emit `+N more` tail
+        // before AGG. The helper consumes only summary entries — other lines
+        // (header, AGG) fall through to the keep-list below.
+        if summary.handle_entry(line, &mut out) {
+            continue;
+        }
+
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(line, &mut in_reactor_summary);
         if reactor_keep || keep_outside_block(line) {
+            // Pre-emit the summary tail when we're about to write AGG.
+            summary.handle_aggregate(line, &mut out);
+            // Detect summary header so subsequent `[ERROR]   ` entries get capped.
+            summary.handle_header(line);
             out.push_str(line);
             out.push('\n');
             keep_continuation = line.starts_with("[ERROR]")
@@ -380,6 +509,13 @@ pub fn filter_surefire(raw: &str) -> String {
     }
 
     block.finish(&mut out);
+    summary.finish(&mut out);
+    if dropped_failing > 0 {
+        out.push_str(&format!(
+            "\n... +{} more failing test classes\n",
+            dropped_failing
+        ));
+    }
     out
 }
 
@@ -457,6 +593,10 @@ pub fn filter_compile(raw: &str) -> String {
 /// Outside any Surefire block, applies the unified keep-list (compile keepers
 /// + install/artifact lines).
 pub fn filter_package(raw: &str) -> String {
+    filter_package_with_cap(raw, crate::core::config::limits().mvn_max_failures)
+}
+
+fn filter_package_with_cap(raw: &str, cap: usize) -> String {
     let stripped = strip_ansi(raw);
     if !has_english_footer(&stripped) {
         return stripped;
@@ -467,6 +607,9 @@ pub fn filter_package(raw: &str) -> String {
     let mut keep_continuation = false;
     let mut in_reactor_summary = false;
     let mut seen_warnings: HashSet<String> = HashSet::new();
+    let mut emitted_failing: usize = 0;
+    let mut dropped_failing: usize = 0;
+    let mut summary = FailuresSummaryCap::new(cap);
 
     for line in stripped.lines() {
         match block.step(line, &mut out) {
@@ -476,11 +619,22 @@ pub fn filter_package(raw: &str) -> String {
                 lines,
                 close,
             } => {
-                block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                if cap == 0 || emitted_failing < cap {
+                    block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                    emitted_failing += 1;
+                } else {
+                    block.drop_failing();
+                    dropped_failing += 1;
+                }
                 keep_continuation = false;
                 continue;
             }
             SurefireStep::Passthrough => {}
+        }
+
+        // Failures-summary cap (see filter_surefire_with_cap for details).
+        if summary.handle_entry(line, &mut out) {
+            continue;
         }
 
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
@@ -488,6 +642,8 @@ pub fn filter_package(raw: &str) -> String {
         let reactor_keep = reactor_summary_keep(line, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
         if reactor_keep || MODULE_BANNER.is_match(line) || keep_outside_block(line) {
+            summary.handle_aggregate(line, &mut out);
+            summary.handle_header(line);
             out.push_str(line);
             out.push('\n');
             keep_continuation = line.starts_with("[ERROR]")
@@ -516,6 +672,13 @@ pub fn filter_package(raw: &str) -> String {
     }
 
     block.finish(&mut out);
+    summary.finish(&mut out);
+    if dropped_failing > 0 {
+        out.push_str(&format!(
+            "\n... +{} more failing test classes\n",
+            dropped_failing
+        ));
+    }
     out
 }
 
@@ -1056,6 +1219,160 @@ mod tests {
         assert!(
             o.contains("there is no POM"),
             "no-pom error preserved; got:\n{}",
+            o
+        );
+    }
+
+    // ── Cap: failing-class blocks ────────────────────────────────────────────
+
+    /// Synthetic fixture with 5 failing classes; with `cap = 3` we expect
+    /// the first 3 failing blocks emitted in full and a
+    /// `... +2 more failing test classes` tail.
+    #[test]
+    fn surefire_caps_failing_blocks_emits_tail() {
+        let mut i = String::from(
+            "[INFO] Scanning for projects...\n\
+             [INFO] -----< x >-----\n",
+        );
+        for n in 1..=5 {
+            i.push_str(&format!(
+                "[INFO] Running x.Fail{n}\n\
+                 [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.0{n}1 s <<< FAILURE! -- in x.Fail{n}\n\
+                 [ERROR] x.Fail{n}.bar -- Time elapsed: 0.0{n}0 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boom{n}\n\
+                 \tat x.Fail{n}.bar(Fail{n}.java:25)\n\
+                 \n",
+                n = n
+            ));
+        }
+        i.push_str("[INFO] BUILD FAILURE\n");
+
+        let o = filter_surefire_with_cap(&i, 3);
+
+        // First 3 blocks emitted with their close lines.
+        for n in 1..=3 {
+            assert!(
+                o.contains(&format!("Running x.Fail{}", n)),
+                "Fail{n} kept; got:\n{}",
+                o,
+                n = n
+            );
+            assert!(
+                o.contains(&format!("in x.Fail{}", n)),
+                "Fail{n} close line kept; got:\n{}",
+                o,
+                n = n
+            );
+        }
+        // Blocks 4 and 5 dropped.
+        for n in 4..=5 {
+            assert!(
+                !o.contains(&format!("Running x.Fail{}", n)),
+                "Fail{n} dropped; got:\n{}",
+                o,
+                n = n
+            );
+            assert!(
+                !o.contains(&format!("AssertionFailedError: boom{}", n)),
+                "Fail{n} exception dropped; got:\n{}",
+                o,
+                n = n
+            );
+        }
+        assert!(
+            o.contains("... +2 more failing test classes"),
+            "tail emitted; got:\n{}",
+            o
+        );
+    }
+
+    /// Cap of 0 means no cap — same fixture but with `cap = 0` should emit
+    /// all five blocks without any tail.
+    #[test]
+    fn surefire_cap_zero_disables_capping() {
+        let mut i = String::from(
+            "[INFO] Scanning for projects...\n\
+             [INFO] -----< x >-----\n",
+        );
+        for n in 1..=5 {
+            i.push_str(&format!(
+                "[INFO] Running x.Fail{n}\n\
+                 [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.0{n}1 s <<< FAILURE! -- in x.Fail{n}\n\
+                 \n",
+                n = n
+            ));
+        }
+        i.push_str("[INFO] BUILD FAILURE\n");
+        let o = filter_surefire_with_cap(&i, 0);
+        for n in 1..=5 {
+            assert!(
+                o.contains(&format!("Running x.Fail{}", n)),
+                "Fail{n} kept under cap=0; got:\n{}",
+                o,
+                n = n
+            );
+        }
+        assert!(
+            !o.contains("more failing test classes"),
+            "no tail under cap=0; got:\n{}",
+            o
+        );
+    }
+
+    /// `[ERROR] Failures:` summary block cap: with N>cap entries, expect the
+    /// first `cap` entries plus a `\n... +(N-cap) more failures\n` tail
+    /// emitted before the aggregate `[ERROR] Tests run:` line.
+    #[test]
+    fn failures_summary_block_is_capped() {
+        let mut i = String::from(
+            "[INFO] -----< x >-----\n\
+             [INFO] Results:\n\
+             [INFO]\n\
+             [ERROR] Failures:\n",
+        );
+        for n in 1..=5 {
+            i.push_str(&format!(
+                "[ERROR]   ClassA.test{n}:25 expected: <a> but was: <b{n}>\n",
+                n = n
+            ));
+        }
+        i.push_str(
+            "[INFO]\n\
+             [ERROR] Tests run: 100, Failures: 5, Errors: 0, Skipped: 0\n\
+             [INFO] BUILD FAILURE\n",
+        );
+        let o = filter_surefire_with_cap(&i, 3);
+
+        // First 3 entries kept.
+        for n in 1..=3 {
+            assert!(
+                o.contains(&format!("ClassA.test{}:25", n)),
+                "entry {n} kept; got:\n{}",
+                o,
+                n = n
+            );
+        }
+        // Entries 4-5 dropped.
+        for n in 4..=5 {
+            assert!(
+                !o.contains(&format!("ClassA.test{}:25", n)),
+                "entry {n} dropped; got:\n{}",
+                o,
+                n = n
+            );
+        }
+        // Tail emitted before aggregate.
+        let tail_idx = o
+            .find("... +2 more failures")
+            .unwrap_or_else(|| panic!("tail must appear; got:\n{}", o));
+        let agg_idx = o
+            .find("[ERROR] Tests run: 100")
+            .unwrap_or_else(|| panic!("aggregate must appear; got:\n{}", o));
+        assert!(
+            tail_idx < agg_idx,
+            "tail must precede aggregate; tail@{} agg@{}; got:\n{}",
+            tail_idx,
+            agg_idx,
             o
         );
     }
