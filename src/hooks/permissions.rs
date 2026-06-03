@@ -216,45 +216,39 @@ fn append_wrapped_rules(rules_value: Option<&Value>, prefixes: &[&str], target: 
     }
 }
 
-/// Cursor: `~/.cursor/cli-config.json` (global) and `<project>/.cursor/cli.json`.
-/// `permissions.allow/deny` with `Shell(...)` entries; no ask list.
+// Project config takes priority; global is the fallback when there is no project config.
+fn scoped_config(dir: &str, project_file: &str, global_file: &str) -> Option<Value> {
+    if let Some(root) = find_project_root() {
+        if let Some(v) = read_json(&root.join(dir).join(project_file)) {
+            return Some(v);
+        }
+    }
+    read_json(&dirs::home_dir()?.join(dir).join(global_file))
+}
+
 fn load_cursor_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut deny = Vec::new();
     let mut allow = Vec::new();
-    let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(CURSOR_DIR).join("cli-config.json"));
-    }
-    if let Some(root) = find_project_root() {
-        paths.push(root.join(CURSOR_DIR).join("cli.json"));
-    }
-    for json in paths.iter().filter_map(|p| read_json(p)) {
-        if let Some(perms) = json.get("permissions") {
-            append_wrapped_rules(perms.get("deny"), &["Shell("], &mut deny);
-            append_wrapped_rules(perms.get("allow"), &["Shell("], &mut allow);
-        }
+    if let Some(perms) = scoped_config(CURSOR_DIR, "cli.json", "cli-config.json")
+        .as_ref()
+        .and_then(|j| j.get("permissions"))
+    {
+        append_wrapped_rules(perms.get("deny"), &["Shell("], &mut deny);
+        append_wrapped_rules(perms.get("allow"), &["Shell("], &mut allow);
     }
     (deny, Vec::new(), allow)
 }
 
-/// Gemini: `~/.gemini/settings.json` and `<project>/.gemini/settings.json`.
-/// `tools.allowed` -> allow, `tools.confirmationRequired` -> ask.
 fn load_gemini_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut ask = Vec::new();
     let mut allow = Vec::new();
-    let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(GEMINI_DIR).join(SETTINGS_JSON));
-    }
-    if let Some(root) = find_project_root() {
-        paths.push(root.join(GEMINI_DIR).join(SETTINGS_JSON));
-    }
     let shells = ["run_shell_command(", "ShellTool("];
-    for json in paths.iter().filter_map(|p| read_json(p)) {
-        if let Some(tools) = json.get("tools") {
-            append_wrapped_rules(tools.get("allowed"), &shells, &mut allow);
-            append_wrapped_rules(tools.get("confirmationRequired"), &shells, &mut ask);
-        }
+    if let Some(tools) = scoped_config(GEMINI_DIR, SETTINGS_JSON, SETTINGS_JSON)
+        .as_ref()
+        .and_then(|j| j.get("tools"))
+    {
+        append_wrapped_rules(tools.get("allowed"), &shells, &mut allow);
+        append_wrapped_rules(tools.get("confirmationRequired"), &shells, &mut ask);
     }
     (Vec::new(), ask, allow)
 }
