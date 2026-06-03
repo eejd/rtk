@@ -1,4 +1,4 @@
-use super::constants::{CLAUDE_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
+use super::constants::{CLAUDE_DIR, CURSOR_DIR, GEMINI_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
 use crate::core::stream::exec_capture;
 use crate::discover::lexer::split_for_permissions;
 use serde_json::Value;
@@ -23,7 +23,23 @@ pub enum PermissionVerdict {
 /// Returns `Default` when no rules match — callers should treat this as ask
 /// to match Claude Code's least-privilege default.
 pub fn check_command(cmd: &str) -> PermissionVerdict {
-    let (deny_rules, ask_rules, allow_rules) = load_permission_rules();
+    check_command_for(cmd, Host::Claude)
+}
+
+/// The agent host whose own permission settings should be consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    Claude,
+    Cursor,
+    Gemini,
+}
+
+pub fn check_command_for(cmd: &str, host: Host) -> PermissionVerdict {
+    let (deny_rules, ask_rules, allow_rules) = match host {
+        Host::Claude => load_permission_rules(),
+        Host::Cursor => load_cursor_rules(),
+        Host::Gemini => load_gemini_rules(),
+    };
     check_command_with_rules(cmd, &deny_rules, &ask_rules, &allow_rules)
 }
 
@@ -165,6 +181,79 @@ fn get_settings_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+fn read_json(path: &std::path::Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<Value>(&content) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!("[rtk] warning: failed to parse permissions from {}", path.display());
+            None
+        }
+    }
+}
+
+fn append_wrapped_rules(rules_value: Option<&Value>, prefixes: &[&str], target: &mut Vec<String>) {
+    let Some(arr) = rules_value.and_then(|v| v.as_array()) else {
+        return;
+    };
+    for rule in arr.iter().filter_map(|r| r.as_str()) {
+        for pre in prefixes {
+            let bare = &pre[..pre.len() - 1];
+            if rule == bare {
+                target.push("*".to_string());
+                break;
+            }
+            if let Some(inner) = rule.strip_prefix(pre).and_then(|s| s.strip_suffix(')')) {
+                target.push(inner.to_string());
+                break;
+            }
+        }
+    }
+}
+
+/// Cursor: `~/.cursor/cli-config.json` (global) and `<project>/.cursor/cli.json`.
+/// `permissions.allow/deny` with `Shell(...)` entries; no ask list.
+fn load_cursor_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut deny = Vec::new();
+    let mut allow = Vec::new();
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(CURSOR_DIR).join("cli-config.json"));
+    }
+    if let Some(root) = find_project_root() {
+        paths.push(root.join(CURSOR_DIR).join("cli.json"));
+    }
+    for json in paths.iter().filter_map(|p| read_json(p)) {
+        if let Some(perms) = json.get("permissions") {
+            append_wrapped_rules(perms.get("deny"), &["Shell("], &mut deny);
+            append_wrapped_rules(perms.get("allow"), &["Shell("], &mut allow);
+        }
+    }
+    (deny, Vec::new(), allow)
+}
+
+/// Gemini: `~/.gemini/settings.json` and `<project>/.gemini/settings.json`.
+/// `tools.allowed` -> allow, `tools.confirmationRequired` -> ask.
+fn load_gemini_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut ask = Vec::new();
+    let mut allow = Vec::new();
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(GEMINI_DIR).join(SETTINGS_JSON));
+    }
+    if let Some(root) = find_project_root() {
+        paths.push(root.join(GEMINI_DIR).join(SETTINGS_JSON));
+    }
+    let shells = ["run_shell_command(", "ShellTool("];
+    for json in paths.iter().filter_map(|p| read_json(p)) {
+        if let Some(tools) = json.get("tools") {
+            append_wrapped_rules(tools.get("allowed"), &shells, &mut allow);
+            append_wrapped_rules(tools.get("confirmationRequired"), &shells, &mut ask);
+        }
+    }
+    (Vec::new(), ask, allow)
 }
 
 /// Locate the project root by walking up from CWD looking for `.claude/`.
