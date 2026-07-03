@@ -1,0 +1,55 @@
+[filters.port]
+description = "Compact MacPorts port output — strip progress banners and install headers"
+match_command = '^(/opt/local/bin/)?port\b'
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  '^The following ports are currently installed',
+  '^--->\s+',
+  "^Can't map the URL",
+  '^Please verify that the directory',
+  '^To use the current port',
+  '^\s*$',
+]
+on_empty = "port: ok"
+
+[[tests.port]]
+name = "installed strips header and blank lines"
+input = """The following ports are currently installed:
+  abseil @20260107.0_0 (active)
+  act @0.2.89_0 (active)
+  age @1.3.1_0 (active)
+
+"""
+expected = """  abseil @20260107.0_0 (active)
+  act @0.2.89_0 (active)
+  age @1.3.1_0 (active)"""
+
+[[tests.port]]
+name = "install progress strips banners keeps warnings"
+input = """--->  Fetching archive for py314-mcp-1.0.0_0.darwin_25.noarch.tbz2
+--->  Extracting py314-mcp-1.0.0_0.darwin_25.noarch.tbz2
+--->  Installing py314-mcp @1.0.0_0
+--->  Activating py314-mcp @1.0.0_0
+Warning: dependencies for py314-mcp have been updated; consider 'port upgrade outdated'
+--->  Cleaning py314-mcp
+"""
+expected = "Warning: dependencies for py314-mcp have been updated; consider 'port upgrade outdated'"
+
+[[tests.port]]
+name = "port info block passes through"
+input = """python314 @3.14.6 (lang)
+Sub-ports:            python314-freethreading
+Variants:             dtrace, lto, optimizations
+Description:          Python is an interpreted, interactive, object-oriented programming language.
+Homepage:             https://www.python.org/
+License:              PSF
+Maintainers:          Email: jmr@macports.org, GitHub: jmroot
+"""
+expected = """python314 @3.14.6 (lang)
+Sub-ports:            python314-freethreading
+Variants:             dtrace, lto, optimizations
+Description:          Python is an interpreted, interactive, object-oriented programming language.
+Homepage:             https://www.python.org/
+License:              PSF
+Maintainers:          Email: jmr@macports.org, GitHub: jmroot"""
