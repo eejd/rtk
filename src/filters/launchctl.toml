@@ -1,0 +1,18 @@
+[filters.launchctl]
+description = "Compact launchctl list — strip com.apple system agents, keep user/macports services"
+match_command = '^launchctl\b'
+strip_ansi = true
+strip_lines_matching = [
+  '\tcom\.apple\.',
+  '^\s*$',
+]
+
+[[tests.launchctl]]
+name = "list strips apple services keeps user and macports"
+input = "PID\tStatus\tLabel\n58751\t-9\tcom.apple.trustd.agent\n-\t0\tcom.apple.MailServiceAgent\n26086\t0\tcom.apple.CoreDevice.remotepairingd\n-\t0\tcom.user.swap-watch\n-\t1\tcom.user.rclone-backup\n1234\t0\torg.macports.node-exporter\n"
+expected = "PID\tStatus\tLabel\n-\t0\tcom.user.swap-watch\n-\t1\tcom.user.rclone-backup\n1234\t0\torg.macports.node-exporter"
+
+[[tests.launchctl]]
+name = "no non-apple services returns header only"
+input = "PID\tStatus\tLabel\n58751\t-9\tcom.apple.trustd.agent\n-\t0\tcom.apple.MailServiceAgent\n"
+expected = "PID\tStatus\tLabel"
