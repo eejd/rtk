@@ -1,0 +1,44 @@
+[filters.colima]
+description = "Compact colima output — strip timestamp/level prefix from status lines"
+match_command = '^colima\b'
+strip_ansi = true
+filter_stderr = true
+replace = [
+  { pattern = '^time="[^"]*" level=\w+ msg="(.+)"$', replacement = "$1" },
+]
+strip_lines_matching = [
+  '^\s*(docker|containerd) socket:',
+  '^\s*$',
+]
+on_empty = "colima: ok"
+
+[[tests.colima]]
+name = "status running strips timestamps keeps key fields"
+input = """time="2026-06-20T21:21:14+01:00" level=info msg="colima [profile=hive] is running using macOS Virtualization.Framework"
+time="2026-06-20T21:21:14+01:00" level=info msg="arch: aarch64"
+time="2026-06-20T21:21:14+01:00" level=info msg="runtime: docker"
+time="2026-06-20T21:21:14+01:00" level=info msg="mountType: virtiofs"
+time="2026-06-20T21:21:14+01:00" level=info msg="address: 192.168.1.210"
+time="2026-06-20T21:21:14+01:00" level=info msg="docker socket: unix:///Users/dep/.colima/hive/docker.sock"
+time="2026-06-20T21:21:14+01:00" level=info msg="containerd socket: unix:///Users/dep/.colima/hive/containerd.sock"
+"""
+expected = """colima [profile=hive] is running using macOS Virtualization.Framework
+arch: aarch64
+runtime: docker
+mountType: virtiofs
+address: 192.168.1.210"""
+
+[[tests.colima]]
+name = "status not running strips timestamp from error"
+input = 'time="2026-06-20T21:19:12+01:00" level=fatal msg="colima is not running"'
+expected = "colima is not running"
+
+[[tests.colima]]
+name = "list table passes through unchanged"
+input = """PROFILE    STATUS     ARCH       CPUS    MEMORY    DISK      RUNTIME    ADDRESS
+default    Stopped    aarch64    2       2GiB      100GiB    docker
+hive       Running    aarch64    4       8GiB      120GiB    docker     192.168.1.210
+"""
+expected = """PROFILE    STATUS     ARCH       CPUS    MEMORY    DISK      RUNTIME    ADDRESS
+default    Stopped    aarch64    2       2GiB      100GiB    docker
+hive       Running    aarch64    4       8GiB      120GiB    docker     192.168.1.210"""
