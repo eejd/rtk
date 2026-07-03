@@ -1,0 +1,34 @@
+[filters.zerotier-cli]
+description = "Compact zerotier-cli output — strip 200 response-code lines"
+match_command = '^(/opt/local/bin/)?zerotier-cli\b'
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  '^200 list(networks|peers)\s*$',
+  '^\s*$',
+]
+
+[[tests.zerotier-cli]]
+name = "listnetworks strips response code keeps table"
+input = """200 listnetworks
+<nwid>              <name>       <mac>              <status> <type>   <dev>        <ZT assigned ips>
+a09acf023300abcd    my-network   a0:9a:cf:02:33:00  OK       PRIVATE  ztXXXXXXXX  10.147.20.5/24
+"""
+expected = """<nwid>              <name>       <mac>              <status> <type>   <dev>        <ZT assigned ips>
+a09acf023300abcd    my-network   a0:9a:cf:02:33:00  OK       PRIVATE  ztXXXXXXXX  10.147.20.5/24"""
+
+[[tests.zerotier-cli]]
+name = "listpeers strips response code keeps table"
+input = """200 listpeers
+<ztaddr>       <ver>   <latency> <role>
+abcdef012345   1.14.0  42ms      LEAF
+000000000001   -       -         PLANET
+"""
+expected = """<ztaddr>       <ver>   <latency> <role>
+abcdef012345   1.14.0  42ms      LEAF
+000000000001   -       -         PLANET"""
+
+[[tests.zerotier-cli]]
+name = "error when daemon not running passes through"
+input = "zerotier-cli: missing port and zerotier-one.port not found in /opt/local/var/lib/zerotier-one"
+expected = "zerotier-cli: missing port and zerotier-one.port not found in /opt/local/var/lib/zerotier-one"
